@@ -126,12 +126,31 @@ def ai_summary_from_metrics(ticker, m):
 def health():
     return {"ok": True}
 
+from fastapi import HTTPException
+
 @app.get("/analyze", response_model=AnalyzeResponse)
-def analyze(ticker: str = Query(..., min_length=1, max_length=10)):
-    tk = ticker.upper().strip()
-    now = time.time()
-    if tk in CACHE and now - CACHE[tk][0] < TTL_SECONDS:
-        return CACHE[tk][1]
+def analyze(ticker: str):
+    try:
+        tk = ticker.upper().strip()
+        m = fetch_metrics(tk)
+        have_any = any(v is not None for k,v in m.items() if k not in ("name","sector"))
+        if not have_any:
+            raise HTTPException(status_code=502, detail="Upstream-Datenquelle lieferte keine verwertbaren Werte.")
+        verdict = classify_verdict(m)
+        risk_score = risk_from_beta(m.get("beta"))
+        return AnalyzeResponse(
+            ticker=tk,
+            as_of=time.strftime("%Y-%m-%d"),
+            metrics=m,
+            verdict=verdict,
+            risk_score=risk_score,
+            ai_summary=ai_summary_from_metrics(tk, m)
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Interner Fehler bei der Datenverarbeitung.")
+
 
     try:
         metrics = fetch_metrics(tk)
