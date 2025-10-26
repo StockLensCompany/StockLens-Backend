@@ -1,26 +1,19 @@
-import os, time
+# app.py
+import os, time, sys, traceback
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import yfinance as yf
-
-# ---- Konfig ----
-ALLOWED_ORIGINS = [
-    "https://stocklens-backend.onrender.com",  # ersetze: deine Framer-URL/Custom-Domain
-    "https://lower-project-897650.framer.app/actual"
-]
+import pandas as pd, numpy as np, yfinance as yf
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
 
-CACHE = {}           # {ticker: (ts, payload)}
-TTL_SECONDS = 6*3600 # 6h
+# CORS: zum Debug GENAU JETZT weit aufmachen, später auf deine Domains einschränken
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=["*"],      # <— NUR ZUM TESTEN
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
 
 class AnalyzeResponse(BaseModel):
     ticker: str
@@ -31,24 +24,52 @@ class AnalyzeResponse(BaseModel):
     ai_summary: str
     disclaimer: str = "Keine Anlageberatung."
 
+def log_exc(e):
+    print("ERROR:", type(e).__name__, str(e), file=sys.stderr)
+    traceback.print_exc()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# ---------- yfinance-robust ----------
+def _num(x):
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)): return None
+        return float(x)
+    except Exception:
+        return None
+
+def _safe_div(a, b):
+    a = _num(a); b = _num(b)
+    if a is None or b in (None, 0): return None
+    return a / b
+
+def _latest(df: pd.DataFrame, key: str):
+    try:
+        if df is None or df.empty: return None
+        if key not in df.index: return None
+        s = df.loc[key]
+        return _num(s.iloc[0]) if hasattr(s, "iloc") else _num(s)
+    except Exception:
+        return None
+
 def fetch_metrics(ticker: str) -> dict:
     t = yf.Ticker(ticker)
 
-    # fast_info (stabiler als info)
+    # fast_info
     try:
         fi = t.fast_info or {}
     except Exception:
         fi = {}
 
-    # Statements defensiv
+    # statements defensiv
     try: fin = t.financials or pd.DataFrame()
     except Exception: fin = pd.DataFrame()
     try: bs  = t.balance_sheet or pd.DataFrame()
     except Exception: bs  = pd.DataFrame()
-    try: cf  = t.cashflow or pd.DataFrame()
-    except Exception: cf  = pd.DataFrame()
 
-    # Meta (optional, nie crashen lassen)
+    # meta optional
     name, sector = None, None
     try:
         gi = getattr(t, "get_info", None)
@@ -80,7 +101,6 @@ def fetch_metrics(ticker: str) -> dict:
 
     eps = _safe_div(net_income, shares_basic)
     pe_ttm = _safe_div(price, eps)
-    beta = None  # optional später berechnen
 
     return {
         "name": name or ticker,
@@ -89,14 +109,13 @@ def fetch_metrics(ticker: str) -> dict:
         "price": price,
         "pe_ttm": pe_ttm,
         "pe_fwd": None,
-        "beta": beta,
+        "beta": None,
         "gross_margin": gross_margin,
         "operating_margin": operating_margin,
         "net_margin": net_margin,
         "revenue_ttm": revenue,
         "dividend_yield": dividend_yield,
         "debt_to_equity": debt_to_equity,
-    }
     }
 
 def classify_verdict(m):
@@ -111,25 +130,15 @@ def risk_from_beta(beta):
     if beta is None: return 3
     return 1 if beta < 0.8 else 2 if beta < 1.1 else 3 if beta < 1.4 else 4 if beta < 1.8 else 5
 
-# --- Platzhalter: Hier könntest du OpenAI callen (weggelassen für Kürze) ---
 def ai_summary_from_metrics(ticker, m):
     name = m.get("name") or ticker
     verdict = classify_verdict(m)
-    return (
-        f"{name} ({ticker}): Kurzfazit. Sektor {m.get('sector') or 'n/a'}, "
-        f"KGV {m.get('pe_ttm') or m.get('pe_fwd') or 'n/a'}, Beta {m.get('beta') or 'n/a'}. "
-        f"Bewertung wirkt {verdict.replace('_','-')} auf Basis einfacher Multiples. "
-        "Prüfpunkte: Wachstum/Nachhaltigkeit der Margen, Verschuldung."
-    )
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-from fastapi import HTTPException
+    return (f"{name} ({ticker}): Kurzfazit. KGV {m.get('pe_ttm') or 'n/a'}, "
+            f"Margin (netto) {m.get('net_margin') or 'n/a'}. "
+            f"Bewertung wirkt {verdict.replace('_','-')} auf Basis einfacher Multiples.")
 
 @app.get("/analyze", response_model=AnalyzeResponse)
-def analyze(ticker: str):
+def analyze(ticker: str = Query(..., min_length=1, max_length=10)):
     try:
         tk = ticker.upper().strip()
         m = fetch_metrics(tk)
@@ -148,27 +157,6 @@ def analyze(ticker: str):
         )
     except HTTPException:
         raise
-    except Exception:
-        raise HTTPException(status_code=500, detail="Interner Fehler bei der Datenverarbeitung.")
-
-
-    try:
-        metrics = fetch_metrics(tk)
-        if not any(metrics.values()):
-            raise HTTPException(status_code=404, detail="Ticker nicht gefunden oder Daten nicht verfügbar.")
-        verdict = classify_verdict(metrics)
-        risk_score = risk_from_beta(metrics.get("beta"))
-        payload = AnalyzeResponse(
-            ticker=tk,
-            as_of=time.strftime("%Y-%m-%d"),
-            metrics=metrics,
-            verdict=verdict,
-            risk_score=risk_score,
-            ai_summary=ai_summary_from_metrics(tk, metrics)
-        ).model_dump()
-        CACHE[tk] = (now, payload)
-        return payload
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Interner Fehler: {str(e)}")
+        log_exc(e)
+        raise HTTPException(status_code=500, detail="Interner Fehler bei der Datenverarbeitung.")
