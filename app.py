@@ -33,20 +33,70 @@ class AnalyzeResponse(BaseModel):
 
 def fetch_metrics(ticker: str) -> dict:
     t = yf.Ticker(ticker)
-    info = getattr(t, "info", {}) or {}
+
+    # fast_info (stabiler als info)
+    try:
+        fi = t.fast_info or {}
+    except Exception:
+        fi = {}
+
+    # Statements defensiv
+    try: fin = t.financials or pd.DataFrame()
+    except Exception: fin = pd.DataFrame()
+    try: bs  = t.balance_sheet or pd.DataFrame()
+    except Exception: bs  = pd.DataFrame()
+    try: cf  = t.cashflow or pd.DataFrame()
+    except Exception: cf  = pd.DataFrame()
+
+    # Meta (optional, nie crashen lassen)
+    name, sector = None, None
+    try:
+        gi = getattr(t, "get_info", None)
+        if callable(gi):
+            meta = gi() or {}
+            name = meta.get("shortName") or meta.get("longName")
+            sector = meta.get("sector")
+    except Exception:
+        pass
+
+    price = _num(fi.get("last_price"))
+    market_cap = _num(fi.get("market_cap"))
+    div_val = _num(fi.get("last_dividend_value"))
+    dividend_yield = _safe_div(div_val, price)
+
+    revenue = _latest(fin, "Total Revenue")
+    gross_profit = _latest(fin, "Gross Profit")
+    operating_income = _latest(fin, "Operating Income")
+    net_income = _latest(fin, "Net Income Common Stockholders") or _latest(fin, "Net Income")
+    shares_basic = _latest(fin, "Basic Average Shares") or _latest(fin, "BasicAverageShares")
+
+    gross_margin = _safe_div(gross_profit, revenue)
+    operating_margin = _safe_div(operating_income, revenue)
+    net_margin = _safe_div(net_income, revenue)
+
+    total_debt = _latest(bs, "Total Debt")
+    total_equity = _latest(bs, "Total Stockholder Equity") or _latest(bs, "Stockholders Equity")
+    debt_to_equity = _safe_div(total_debt, total_equity)
+
+    eps = _safe_div(net_income, shares_basic)
+    pe_ttm = _safe_div(price, eps)
+    beta = None  # optional später berechnen
+
     return {
-        "name": info.get("shortName"),
-        "sector": info.get("sector"),
-        "market_cap": info.get("marketCap"),
-        "pe_ttm": info.get("trailingPE"),
-        "pe_fwd": info.get("forwardPE"),
-        "beta": info.get("beta"),
-        "gross_margin": info.get("grossMargins"),
-        "operating_margin": info.get("operatingMargins"),
-        "net_margin": info.get("profitMargins"),
-        "revenue_ttm": info.get("totalRevenue"),
-        "dividend_yield": info.get("dividendYield"),
-        "debt_to_equity": info.get("debtToEquity")
+        "name": name or ticker,
+        "sector": sector,
+        "market_cap": market_cap,
+        "price": price,
+        "pe_ttm": pe_ttm,
+        "pe_fwd": None,
+        "beta": beta,
+        "gross_margin": gross_margin,
+        "operating_margin": operating_margin,
+        "net_margin": net_margin,
+        "revenue_ttm": revenue,
+        "dividend_yield": dividend_yield,
+        "debt_to_equity": debt_to_equity,
+    }
     }
 
 def classify_verdict(m):
