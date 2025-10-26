@@ -6,8 +6,8 @@ import yfinance as yf
 
 # ---- Konfig ----
 ALLOWED_ORIGINS = [
-    "https://your-framer-site.framer.website",  # ersetze: deine Framer-URL/Custom-Domain
-    "https://www.deinedomain.tld"
+    "https://stocklens-backend.onrender.com",  # ersetze: deine Framer-URL/Custom-Domain
+    "https://lower-project-897650.framer.app/actual"
 ]
 
 app = FastAPI()
