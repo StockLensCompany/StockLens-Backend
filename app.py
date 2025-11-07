@@ -287,35 +287,58 @@ def probe(ticker: str):
 
 @app.get("/diag")
 def diag(ticker: str = "AAPL"):
-    """Tieferer Diagnostik-Endpoint: zeigt, was Yahoo liefert (Counts/Flags, keine großen Payloads)."""
+    """
+    Diagnostik: zeigt fast_info (snake+camel), History-Rowcounts und Statement-Rowcounts.
+    Damit siehst du sofort, ob Yahoo Daten liefert und unter welchen Keys.
+    """
     tk = ticker.upper().strip()
     t = _ticker(tk)
-    out = {"ticker": tk, "host": socket.gethostname()}
+    out = {"ticker": tk}
+
+    # fast_info auslesen
     try:
         fi = t.fast_info or {}
-        out["fast_info_keys"] = list(fi.keys())[:10]
-        out["fast_info_sample"] = {k: fi[k] for k in ["last_price","last_close","regular_market_price","market_cap","dividend_yield"] if k in fi}
+        out["fast_info_keys"] = sorted(list(fi.keys()))[:25]  # nur die ersten 25 Keys
+        # Lies die wesentlichen Werte — snake_case UND camelCase
+        def get(*keys):
+            return _num(_fi_get(fi, *keys))
+
+        out["fast_info_sample"] = {
+            "price": get("last_price", "lastPrice", "regular_market_price", "regularMarketPrice", "previous_close", "previousClose", "open"),
+            "market_cap": get("market_cap", "marketCap"),
+            "dividend_yield": get("dividend_yield", "dividendYield"),
+            "previous_close": get("previous_close", "previousClose"),
+            "open": get("open", "Open"),
+            "dayHigh": get("day_high", "dayHigh"),
+            "dayLow": get("day_low", "dayLow"),
+            "fiftyDayAverage": get("fifty_day_average", "fiftyDayAverage"),
+        }
     except Exception as e:
         out["fast_info_error"] = str(e)
 
+    # history-Rowcounts (wenn 0 → Yahoo blockt Chartdaten, ist ok; wir nutzen fast_info)
     try:
-        h = t.history(period="5d", auto_adjust=False)
-        out["history_5d_rows"] = 0 if h is None else int(h.shape[0])
+        h5 = t.history(period="5d", auto_adjust=False)
+        out["history_5d_rows"] = 0 if h5 is None else int(h5.shape[0])
     except Exception as e:
         out["history_5d_error"] = str(e)
+    try:
+        h1m = t.history(period="1mo", auto_adjust=False)
+        out["history_1mo_rows"] = 0 if h1m is None else int(h1m.shape[0])
+    except Exception as e:
+        out["history_1mo_error"] = str(e)
 
+    # Statements
     try:
         fin = t.financials
         out["financials_rows"] = 0 if fin is None else int(fin.shape[0])
     except Exception as e:
         out["financials_error"] = str(e)
-
     try:
         bs = t.balance_sheet
         out["balance_sheet_rows"] = 0 if bs is None else int(bs.shape[0])
     except Exception as e:
         out["balance_sheet_error"] = str(e)
-
     try:
         d = t.dividends
         out["dividends_rows"] = 0 if d is None else int(d.shape[0])
@@ -323,6 +346,7 @@ def diag(ticker: str = "AAPL"):
         out["dividends_error"] = str(e)
 
     return out
+
 
 @app.get("/analyze", response_model=AnalyzeResponse)
 def analyze(ticker: str = Query(..., min_length=1, max_length=12)):
