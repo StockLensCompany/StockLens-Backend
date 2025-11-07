@@ -94,6 +94,16 @@ def _latest(df: pd.DataFrame, key: str):
     except Exception:
         return None
 
+def _fi_get(fi: dict, *keys):
+    """Erstes vorhandenes Key-Match aus fast_info zurückgeben (snake_case + camelCase)."""
+    if not isinstance(fi, dict):
+        return None
+    for k in keys:
+        if k in fi:
+            return fi.get(k)
+    return None
+
+
 # ------------------------------
 # yfinance Helfer (immer mit SESSION)
 # ------------------------------
@@ -102,15 +112,23 @@ def _ticker(ticker: str) -> yf.Ticker:
     return yf.Ticker(ticker, session=SESSION)
 
 def _last_price(t: yf.Ticker):
-    """Preis robust bestimmen: fast_info -> history(5d) -> history(1mo)."""
-    # 1) fast_info
+    """Preis robust: fast_info (snake/camel) -> history(5d) -> history(1mo)."""
     try:
         fi = t.fast_info or {}
-        p = fi.get("last_price") or fi.get("last_close") or fi.get("regular_market_price")
+        p = _fi_get(
+            fi,
+            # snake_case Varianten
+            "last_price", "last_close", "regular_market_price", "previous_close",
+            # camelCase Varianten
+            "lastPrice", "lastClose", "regularMarketPrice", "previousClose",
+            # weitere sinnvolle Fallbacks
+            "open", "dayHigh", "dayLow", "fiftyDayAverage"
+        )
         if p is not None:
             return _num(p)
     except Exception:
         pass
+
     # 2) history 5d
     try:
         h = t.history(period="5d", auto_adjust=False)
@@ -120,6 +138,7 @@ def _last_price(t: yf.Ticker):
                 return _num(v.iloc[-1])
     except Exception:
         pass
+
     # 3) history 1mo
     try:
         h = t.history(period="1mo", auto_adjust=False)
@@ -129,50 +148,63 @@ def _last_price(t: yf.Ticker):
                 return _num(v.iloc[-1])
     except Exception:
         pass
+
     return None
+
 
 def _dividend_yield(t: yf.Ticker, price):
     """Dividendenrendite: fast_info -> Summe der letzten 4 Zahlungen / Preis."""
     try:
         fi = t.fast_info or {}
-        y = fi.get("dividend_yield")
+        # Prüft sowohl snake_case- als auch camelCase-Schlüssel
+        y = _fi_get(fi, "dividend_yield", "dividendYield")
         if y is not None:
             return _num(y)
     except Exception:
         pass
+
     try:
         if price is None:
             return None
         d = t.dividends
         if d is not None and not d.empty:
-            annual = float(d.tail(4).sum())  # grobe Annäherung
+            # grobe Annäherung: Summe der letzten 4 Dividenden / aktueller Preis
+            annual = float(d.tail(4).sum())
             return _safe_div(annual, price)
     except Exception:
         pass
+
     return None
 
 # ------------------------------
 # Daten holen (ohne .info)
 # ------------------------------
 def fetch_metrics(ticker: str) -> dict:
-    t = _ticker(ticker)
+    """Holt alle relevanten Kennzahlen robust über yfinance."""
+    t = _ticker(ticker)  # erzeugt Ticker mit Requests-Session (siehe make_session)
 
-    # Basis
+    # === BASISDATEN ===
     price = _last_price(t)
+
+    # Market Cap – prüft snake_case + camelCase
     market_cap = None
     try:
         fi = t.fast_info or {}
-        market_cap = _num(fi.get("market_cap"))
+        market_cap = _num(_fi_get(fi, "market_cap", "marketCap"))
     except Exception:
         pass
 
-    # Statements defensiv lesen
-    try: fin = t.financials or pd.DataFrame()      # Income Statement (FY)
-    except Exception: fin = pd.DataFrame()
-    try: bs  = t.balance_sheet or pd.DataFrame()   # Balance Sheet (FY)
-    except Exception: bs  = pd.DataFrame()
+    # === FINANCIAL STATEMENTS (defensiv laden) ===
+    try:
+        fin = t.financials or pd.DataFrame()      # Income Statement (FY)
+    except Exception:
+        fin = pd.DataFrame()
+    try:
+        bs = t.balance_sheet or pd.DataFrame()    # Balance Sheet (FY)
+    except Exception:
+        bs = pd.DataFrame()
 
-    # Meta (optional)
+    # === META (Name, Sektor) ===
     name, sector = None, None
     try:
         gi = getattr(t, "get_info", None)
@@ -183,10 +215,10 @@ def fetch_metrics(ticker: str) -> dict:
     except Exception:
         pass
 
-    # Dividendenrendite
+    # === DIVIDENDENRENDITe ===
     dividend_yield = _dividend_yield(t, price)
 
-    # Income Statement Kennzahlen
+    # === INCOME STATEMENT KENNZAHLEN ===
     revenue = _latest(fin, "Total Revenue")
     gross_profit = _latest(fin, "Gross Profit")
     operating_income = _latest(fin, "Operating Income")
@@ -198,15 +230,16 @@ def fetch_metrics(ticker: str) -> dict:
     operating_margin = _safe_div(operating_income, revenue)
     net_margin = _safe_div(net_income, revenue)
 
-    # Bilanz
+    # === BILANZ-KENNZAHLEN ===
     total_debt = _latest(bs, "Total Debt")
     total_equity = _latest(bs, "Total Stockholder Equity") or _latest(bs, "Stockholders Equity")
     debt_to_equity = _safe_div(total_debt, total_equity)
 
-    # P/E (einfach)
+    # === BEWERTUNG ===
     eps = _safe_div(net_income, shares_basic)
     pe_ttm = _safe_div(price, eps)
 
+    # === ERGEBNIS ===
     return {
         "name": name or ticker,
         "sector": sector,
@@ -214,25 +247,15 @@ def fetch_metrics(ticker: str) -> dict:
         "price": price,
         "pe_ttm": pe_ttm,
         "pe_fwd": None,
-        "beta": None,  # Optional später via History vs SPY approximieren
+        "beta": None,  # optional später via SPY-Beta
         "gross_margin": gross_margin,
         "operating_margin": operating_margin,
         "net_margin": net_margin,
-        "revenue_ttm": revenue,          # FY-Wert als grobe Näherung
+        "revenue_ttm": revenue,
         "dividend_yield": dividend_yield,
         "debt_to_equity": debt_to_equity,
     }
 
-# ------------------------------
-# Bewertung + Risiko
-# ------------------------------
-def classify_verdict(m: dict) -> str:
-    pe = m.get("pe_ttm") or m.get("pe_fwd")
-    if pe is None: return "fair"
-    if pe < 12: return "cheap"
-    if pe < 20: return "fair"
-    if pe < 30: return "fair_to_expensive"
-    return "expensive"
 
 def risk_from_beta(beta: Optional[float]) -> int:
     if beta is None: return 3
