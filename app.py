@@ -1,22 +1,51 @@
 # app.py
-import os, time, sys, traceback
+import os, time, sys, traceback, socket
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ------------------------------
-# FastAPI App + CORS (zum Testen weit offen; später Domains einschränken)
+# Requests-Session: Desktop-User-Agent + Retries/Timeouts
 # ------------------------------
-app = FastAPI(title="StockLens Backend", version="1.0")
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/119.0 Safari/537.36"),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.8,de;q=0.6"
+    })
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"])
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = make_session()
+
+# ------------------------------
+# FastAPI App + CORS (zum Testen weit offen; später einschränken)
+# ------------------------------
+app = FastAPI(title="StockLens Backend", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # NUR ZUM DEBUGGEN! Später: exakt deine Framer/Prod-Domains eintragen.
+    allow_origins=["*"],   # NUR ZUM DEBUGGEN! Später: exakt deine Framer/Prod-Domains eintragen.
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -55,7 +84,7 @@ def _safe_div(a, b):
     return a / b
 
 def _latest(df: pd.DataFrame, key: str):
-    """Holt den neuesten verfügbaren Wert für 'key' aus einem yfinance DataFrame (robust gegen NaN/Spaltenreihenfolge)."""
+    """Holt den neuesten verfügbaren Wert für 'key' (robust gegen NaN/Spaltenreihenfolge)."""
     try:
         if df is None or df.empty or key not in df.index:
             return None
@@ -64,6 +93,13 @@ def _latest(df: pd.DataFrame, key: str):
         return _num(s.iloc[0]) if not s.empty else None
     except Exception:
         return None
+
+# ------------------------------
+# yfinance Helfer (immer mit SESSION)
+# ------------------------------
+def _ticker(ticker: str) -> yf.Ticker:
+    # Ticker IMMER mit der Session erzeugen
+    return yf.Ticker(ticker, session=SESSION)
 
 def _last_price(t: yf.Ticker):
     """Preis robust bestimmen: fast_info -> history(5d) -> history(1mo)."""
@@ -77,7 +113,7 @@ def _last_price(t: yf.Ticker):
         pass
     # 2) history 5d
     try:
-        h = t.history(period="5d")
+        h = t.history(period="5d", auto_adjust=False)
         if h is not None and not h.empty:
             v = h["Close"].dropna()
             if not v.empty:
@@ -86,7 +122,7 @@ def _last_price(t: yf.Ticker):
         pass
     # 3) history 1mo
     try:
-        h = t.history(period="1mo")
+        h = t.history(period="1mo", auto_adjust=False)
         if h is not None and not h.empty:
             v = h["Close"].dropna()
             if not v.empty:
@@ -109,7 +145,7 @@ def _dividend_yield(t: yf.Ticker, price):
             return None
         d = t.dividends
         if d is not None and not d.empty:
-            annual = float(d.tail(4).sum())  # grobe Annäherung aus den letzten 4 Zahlungen
+            annual = float(d.tail(4).sum())  # grobe Annäherung
             return _safe_div(annual, price)
     except Exception:
         pass
@@ -119,7 +155,7 @@ def _dividend_yield(t: yf.Ticker, price):
 # Daten holen (ohne .info)
 # ------------------------------
 def fetch_metrics(ticker: str) -> dict:
-    t = yf.Ticker(ticker)
+    t = _ticker(ticker)
 
     # Basis
     price = _last_price(t)
@@ -205,12 +241,12 @@ def risk_from_beta(beta: Optional[float]) -> int:
 def ai_summary_from_metrics(ticker: str, m: dict) -> str:
     name = m.get("name") or ticker
     verdict = classify_verdict(m)
-    return (
-        f"{name} ({ticker}): Kurzfazit. "
-        f"KGV {m.get('pe_ttm') if m.get('pe_ttm') is not None else 'n/a'}, "
-        f"netto-Marge {round(m.get('net_margin')*100,1)}% " if m.get('net_margin') is not None else "netto-Marge n/a. "
-        f"Bewertung wirkt {verdict.replace('_','-')} auf Basis einfacher Multiples."
-    )
+    parts = []
+    parts.append(f"{name} ({ticker}): Kurzfazit.")
+    parts.append(f"KGV {m.get('pe_ttm') if m.get('pe_ttm') is not None else 'n/a'}.")
+    parts.append(f"netto-Marge {round(m.get('net_margin')*100,1)}%" if m.get('net_margin') is not None else "netto-Marge n/a.")
+    parts.append(f"Bewertung wirkt {verdict.replace('_','-')} auf Basis einfacher Multiples.")
+    return " ".join(parts)
 
 # ------------------------------
 # Endpoints
@@ -226,10 +262,50 @@ def probe(ticker: str):
     m = fetch_metrics(tk)
     return {"ticker": tk, "metrics": m}
 
+@app.get("/diag")
+def diag(ticker: str = "AAPL"):
+    """Tieferer Diagnostik-Endpoint: zeigt, was Yahoo liefert (Counts/Flags, keine großen Payloads)."""
+    tk = ticker.upper().strip()
+    t = _ticker(tk)
+    out = {"ticker": tk, "host": socket.gethostname()}
+    try:
+        fi = t.fast_info or {}
+        out["fast_info_keys"] = list(fi.keys())[:10]
+        out["fast_info_sample"] = {k: fi[k] for k in ["last_price","last_close","regular_market_price","market_cap","dividend_yield"] if k in fi}
+    except Exception as e:
+        out["fast_info_error"] = str(e)
+
+    try:
+        h = t.history(period="5d", auto_adjust=False)
+        out["history_5d_rows"] = 0 if h is None else int(h.shape[0])
+    except Exception as e:
+        out["history_5d_error"] = str(e)
+
+    try:
+        fin = t.financials
+        out["financials_rows"] = 0 if fin is None else int(fin.shape[0])
+    except Exception as e:
+        out["financials_error"] = str(e)
+
+    try:
+        bs = t.balance_sheet
+        out["balance_sheet_rows"] = 0 if bs is None else int(bs.shape[0])
+    except Exception as e:
+        out["balance_sheet_error"] = str(e)
+
+    try:
+        d = t.dividends
+        out["dividends_rows"] = 0 if d is None else int(d.shape[0])
+    except Exception as e:
+        out["dividends_error"] = str(e)
+
+    return out
+
 @app.get("/analyze", response_model=AnalyzeResponse)
 def analyze(ticker: str = Query(..., min_length=1, max_length=12)):
     try:
         tk = ticker.upper().strip()
+
         # Optionaler Fake-Modus für E2E-Tests ohne yfinance
         if os.getenv("DEBUG_FAKE") == "1":
             return AnalyzeResponse(
@@ -243,7 +319,7 @@ def analyze(ticker: str = Query(..., min_length=1, max_length=12)):
 
         m = fetch_metrics(tk)
 
-        # Mindestanforderung: wenigstens Preis ODER Market Cap, sonst kompakte Hinweis-Antwort (kein 502!)
+        # Mindestanforderung: wenigstens Preis ODER Market Cap
         if m.get("price") is None and m.get("market_cap") is None:
             return AnalyzeResponse(
                 ticker=tk,
@@ -267,5 +343,4 @@ def analyze(ticker: str = Query(..., min_length=1, max_length=12)):
         )
     except Exception as e:
         log_exc(e)
-        # Keine Interna an den Client leaken:
         raise HTTPException(status_code=500, detail="Interner Fehler bei der Datenverarbeitung.")
