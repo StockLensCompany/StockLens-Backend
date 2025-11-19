@@ -95,6 +95,16 @@ def _latest(df: pd.DataFrame, key: str):
         return None
 
 def _fi_get(fi: dict, *keys):
+    """Gibt den ersten vorhandenen Key aus fast_info zurück (unterstützt snake_case & camelCase)."""
+    if not isinstance(fi, dict):
+        return None
+    for k in keys:
+        if k in fi:
+            return fi.get(k)
+    return None
+
+
+def _fi_get(fi: dict, *keys):
     """Erstes vorhandenes Key-Match aus fast_info zurückgeben (snake_case + camelCase)."""
     if not isinstance(fi, dict):
         return None
@@ -289,34 +299,35 @@ def probe(ticker: str):
 def diag(ticker: str = "AAPL"):
     """
     Diagnostik: zeigt fast_info (snake+camel), History-Rowcounts und Statement-Rowcounts.
-    Damit siehst du sofort, ob Yahoo Daten liefert und unter welchen Keys.
     """
     tk = ticker.upper().strip()
     t = _ticker(tk)
     out = {"ticker": tk}
 
-    # fast_info auslesen
+    # fast_info lesen
     try:
         fi = t.fast_info or {}
-        out["fast_info_keys"] = sorted(list(fi.keys()))[:25]  # nur die ersten 25 Keys
-        # Lies die wesentlichen Werte — snake_case UND camelCase
-        def get(*keys):
+        out["fast_info_keys"] = sorted(list(fi.keys()))[:25]
+
+        # kleiner Getter, der snake+camel und Numeric-Cast berücksichtigt
+        def getnum(*keys):
             return _num(_fi_get(fi, *keys))
 
         out["fast_info_sample"] = {
-            "price": get("last_price", "lastPrice", "regular_market_price", "regularMarketPrice", "previous_close", "previousClose", "open"),
-            "market_cap": get("market_cap", "marketCap"),
-            "dividend_yield": get("dividend_yield", "dividendYield"),
-            "previous_close": get("previous_close", "previousClose"),
-            "open": get("open", "Open"),
-            "dayHigh": get("day_high", "dayHigh"),
-            "dayLow": get("day_low", "dayLow"),
-            "fiftyDayAverage": get("fifty_day_average", "fiftyDayAverage"),
+            "price": getnum("last_price", "lastPrice", "regular_market_price", "regularMarketPrice",
+                            "previous_close", "previousClose", "open"),
+            "market_cap": getnum("market_cap", "marketCap"),
+            "dividend_yield": getnum("dividend_yield", "dividendYield"),
+            "previous_close": getnum("previous_close", "previousClose"),
+            "open": getnum("open", "Open"),
+            "dayHigh": getnum("day_high", "dayHigh"),
+            "dayLow": getnum("day_low", "dayLow"),
+            "fiftyDayAverage": getnum("fifty_day_average", "fiftyDayAverage"),
         }
     except Exception as e:
         out["fast_info_error"] = str(e)
 
-    # history-Rowcounts (wenn 0 → Yahoo blockt Chartdaten, ist ok; wir nutzen fast_info)
+    # history Rowcounts
     try:
         h5 = t.history(period="5d", auto_adjust=False)
         out["history_5d_rows"] = 0 if h5 is None else int(h5.shape[0])
@@ -328,7 +339,7 @@ def diag(ticker: str = "AAPL"):
     except Exception as e:
         out["history_1mo_error"] = str(e)
 
-    # Statements
+    # Statements Rowcounts
     try:
         fin = t.financials
         out["financials_rows"] = 0 if fin is None else int(fin.shape[0])
