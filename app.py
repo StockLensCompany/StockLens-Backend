@@ -1,4 +1,77 @@
 # app.py
+# app.py
+import os, time, sys, traceback
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI(title="StockLens Backend", version="1.2")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # zum Testen
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AnalyzeResponse(BaseModel):
+    ticker: str
+    as_of: str
+    metrics: dict
+    verdict: str
+    risk_score: int
+    ai_summary: str
+    disclaimer: str = "Keine Anlageberatung."
+
+def log_exc(e: Exception):
+    print("ERROR:", type(e).__name__, str(e), file=sys.stderr)
+    import traceback as tb
+    tb.print_exc()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# -----------------------------------------------------------
+# DEBUG_FAKE-Kurzschluss: startet IMMER, auch ohne yfinance
+# -----------------------------------------------------------
+DEBUG_FAKE = os.getenv("DEBUG_FAKE") == "1"
+
+if DEBUG_FAKE:
+    @app.get("/analyze", response_model=AnalyzeResponse)
+    def analyze(ticker: str = Query(..., min_length=1, max_length=12)):
+        tk = ticker.upper().strip()
+        return AnalyzeResponse(
+            ticker=tk,
+            as_of=time.strftime("%Y-%m-%d"),
+            metrics={"pe_ttm": 22.1, "net_margin": 0.27, "price": 100.0, "market_cap": 1e11},
+            verdict="fair_to_expensive",
+            risk_score=3,
+            ai_summary="Fake-Analyse (DEBUG_FAKE=1).",
+        )
+
+    @app.get("/probe")
+    def probe(ticker: str):
+        return {"ticker": ticker.upper(), "metrics": {}}
+
+    @app.get("/diag")
+    def diag(ticker: str = "AAPL"):
+        return {"ticker": ticker.upper(), "note": "DEBUG_FAKE=1 aktiv"}
+# -----------------------------------------------------------
+# Nur wenn KEIN Fake aktiv ist, Rest des Backends importieren
+# -----------------------------------------------------------
+else:
+    import numpy as np
+    import pandas as pd
+    import yfinance as yf
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    # HIER kommen alle restlichen Funktionen (make_session, _fi_get,
+    # _last_price, _dividend_yield, fetch_metrics, /probe, /diag, /analyze …)
+
 import os, time, sys, traceback, socket
 from typing import Optional
 
