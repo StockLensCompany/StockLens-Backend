@@ -69,6 +69,9 @@ else:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
 
+FMP_KEY = os.getenv("FMP_API_KEY")
+
+
     # HIER kommen alle restlichen Funktionen (make_session, _fi_get,
     # _last_price, _dividend_yield, fetch_metrics, /probe, /diag, /analyze …)
 
@@ -259,6 +262,53 @@ def _dividend_yield(t: yf.Ticker, price):
 
     return None
 
+def _fmp_get_quote(ticker: str):
+    """Fallback: price & marketCap von FMP (nur wenn yfinance nichts lieferte)."""
+    if not FMP_KEY:
+        return None, None
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/quote/{ticker}",
+            params={"apikey": FMP_KEY},
+            timeout=6,
+        )
+        r.raise_for_status()
+        arr = r.json() or []
+        if not arr:
+            return None, None
+        q = arr[0]
+        price = _num(q.get("price"))
+        mc = _num(q.get("marketCap"))
+        return price, mc
+    except Exception:
+        return None, None
+
+def _fmp_get_ratios_ttm(ticker: str):
+    """Fallback: Margins, D/E, Revenue TTM von FMP, falls yfinance leer ist."""
+    if not FMP_KEY:
+        return {}
+    out = {}
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/ratios-ttm/{ticker}",
+            params={"apikey": FMP_KEY},
+            timeout=6,
+        )
+        r.raise_for_status()
+        arr = r.json() or []
+        if not arr:
+            return out
+        x = arr[0]
+        out["gross_margin"]      = _num(x.get("grossProfitMarginTTM"))
+        out["operating_margin"]  = _num(x.get("operatingProfitMarginTTM"))
+        out["net_margin"]        = _num(x.get("netProfitMarginTTM"))
+        out["debt_to_equity"]    = _num(x.get("debtEquityRatioTTM"))
+        out["revenue_ttm"]       = _num(x.get("revenueTTM"))
+        return out
+    except Exception:
+        return {}
+
+
 # ------------------------------
 # Daten holen (ohne .info)
 # ------------------------------
@@ -277,6 +327,15 @@ def fetch_metrics(ticker: str) -> dict:
     except Exception:
         pass
 
+    # === PATCH ====
+    # Fallback: Wenn yfinance weder price noch market_cap brachte, nimm FMP
+    if price is None or market_cap is None:
+        f_price, f_mc = _fmp_get_quote(ticker)
+        if price is None:
+            price = f_price
+        if market_cap is None:
+            market_cap = f_mc
+    
     # === FINANCIAL STATEMENTS (defensiv laden) ===
     try:
         fin = t.financials or pd.DataFrame()      # Income Statement (FY)
@@ -322,6 +381,15 @@ def fetch_metrics(ticker: str) -> dict:
     eps = _safe_div(net_income, shares_basic)
     pe_ttm = _safe_div(price, eps)
 
+    # === PATCH ====
+    if any(v is None for v in [gross_margin, operating_margin, net_margin, debt_to_equity, revenue]):
+        f = _fmp_get_ratios_ttm(ticker)
+        gross_margin      = gross_margin      if gross_margin      is not None else f.get("gross_margin")
+        operating_margin  = operating_margin  if operating_margin  is not None else f.get("operating_margin")
+        net_margin        = net_margin        if net_margin        is not None else f.get("net_margin")
+        debt_to_equity    = debt_to_equity    if debt_to_equity    is not None else f.get("debt_to_equity")
+        revenue           = revenue           if revenue           is not None else f.get("revenue_ttm")
+    
     # === ERGEBNIS ===
     return {
         "name": name or ticker,
